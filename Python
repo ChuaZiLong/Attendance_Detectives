@@ -1,0 +1,757 @@
+from pymongo import MongoClient
+from pymongo.server_api import ServerApi
+from typing import Final
+from datetime import datetime
+
+from telegram import Update, Bot
+from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes, ConversationHandler
+
+import random
+
+# Behind the scenes
+
+print('Starting up bot...')
+
+TOKEN: Final = '6265071666:AAGMJ5Er0lSIzgVNm5UAdjiUTFOx9QYOouE'
+BOT_USERNAME: Final = '@attendancedetectivesbot'
+bot = Bot(TOKEN)
+app = Application.builder().token(TOKEN).build()
+
+# Global flag to control bot's active state
+is_bot_active = True
+
+# Dictionary to temporarily store user data
+user_data = {}
+move_target = {}
+
+# MongoDB connection string
+client = MongoClient('mongodb+srv://verywierd61:tCBZK422BoHp7JPO@cluster0.k0kxddo.mongodb.net/?retryWrites=true&w=majority',server_api=ServerApi('1'))
+
+# Group database
+db_1 = client['Attendance_Detectives']
+mod_col_1 = db_1['Modules']
+user_col_1 = db_1['Users']
+ta_col_1 = db_1['TA']
+
+# Attendance database
+db_2 = client['Attendance_Detectives_Attendance_Sheet']
+mod_col_2 = db_2['Modules']
+user_col_2 = db_2['Users']
+
+try:
+    client.admin.command('ping')
+    print("Pinged your deployment. You successfully connected to MongoDB!")
+except Exception as e:
+    print(e)
+
+
+# General commands
+
+# Command to start the bot
+async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global is_bot_active
+    is_bot_active = True
+    await update.message.reply_text('Hello there! I\'m a bot. What\'s up?')
+
+
+# Command to stop the bot
+async def stop_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global is_bot_active
+    is_bot_active = False
+    await update.message.reply_text('Bot has been stopped.')
+
+
+# Command to get help
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("start - Starts the bot\n"
+                                    "stop - Stops the bot\nhelp - Provides instructions on how to operate the bot\n"
+                                    "input_info - Prompts the bot to ask you for your module code, tutorial group, and intra-tutorial group\n"
+                                    "info - Retrieves your information which is stored temporarily until you use /upload\n"
+                                    "upload - Uploads your information onto a MongoDB database\n"
+                                    "chat - Sets your current chat group as the official chat group for your intra-tutorial group\n"
+                                    "set_code - Sets the passcode for attendance-taking\n"
+                                    "attendance - Allows you to mark your attendance\n"
+                                    "set_ta - Sets yourself as a Teaching Assistant\n"
+                                    "set_size - Sets the size of intra-tutorial groups\n"
+                                    "move - Moves students between groups\n"
+                                    "wipe_database - Wipes the MongoDB databases completely")
+
+# Input commands
+
+MODULE_CODE, TUTORIAL_GROUP, GROUP_NUMBER = range(3)
+
+async def input_info(update, context):
+    # Ask the user for their module code
+    await update.message.reply_text("Please enter your module code:")
+    return MODULE_CODE
+
+
+async def input_module_code(update, context):
+    user_id = str(update.message.from_user['id'])
+    # Save the module code
+    module_code = update.message.text
+    if user_id not in user_data:
+        user_data[user_id] = {'module_code': None, 'tutorial_group': None, 'group_number': None}
+    user_data[user_id]['module_code'] = module_code
+    # Ask the user for their tutorial group
+    await update.message.reply_text("Thank you! Now, please enter your tutorial group:")
+    return TUTORIAL_GROUP
+
+
+async def input_tutorial_group(update, context):
+    user_id = str(update.message.from_user['id'])
+    # Save the tutorial group
+    tutorial_group = update.message.text
+    user_data[user_id]['tutorial_group'] = tutorial_group
+    # Ask the user for their intra-tutorial group number
+    await update.message.reply_text("Great! Finally, please enter your intra-tutorial group number:")
+    return GROUP_NUMBER
+
+
+async def input_group_number(update, context):
+    user_id = str(update.message.from_user['id'])
+    # Save the intra-tutorial group number
+    group_number = update.message.text
+    user_data[user_id]['group_number'] = group_number
+    # Thank the user and end the conversation
+    await update.message.reply_text("Thank you! All your information has been recorded.")
+    return ConversationHandler.END
+
+
+async def cancel(update, context):
+    await update.message.reply_text('Operation cancelled.')
+    return ConversationHandler.END
+
+
+# Conversation handler
+conversation_handler = ConversationHandler(
+    entry_points=[CommandHandler('input_info', input_info)],
+    states={
+        MODULE_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_module_code)],
+        TUTORIAL_GROUP: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_tutorial_group)],
+        GROUP_NUMBER: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_group_number)],
+    },
+    fallbacks=[CommandHandler('cancel', cancel)],
+)
+
+# Add the conversation handler to the dispatcher
+app.add_handler(conversation_handler)
+
+
+# Command to tell the user their module code and tutorial group
+async def get_my_info(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user['id'])
+    if user_id in user_data:
+        module_code = user_data[user_id]['module_code']
+        tutorial_group = user_data[user_id]['tutorial_group']
+        group = user_data[user_id]['group_number']
+        if module_code and tutorial_group and group:
+            await update.message.reply_text(
+                f"Your module code is: {module_code}\nYour tutorial group is: {tutorial_group}\nYour group is: {group}")
+        else:
+            await update.message.reply_text("Please use the commands to input your data.")
+    else:
+        await update.message.reply_text("Please use the commands to input your data.")
+
+
+# Function to send the confirmation message
+async def input_confirmation(update: Update, user_id: int):
+    await update.message.reply_text("Your data has been inputted successfully.")
+
+
+# Group commands
+
+# Command to submit data to MongoDB
+async def upload(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user['id'])
+    user_name = str(update.message.from_user['username'])
+    if user_id in user_data:
+        module = user_data[user_id]['module_code']
+        tutorial = user_data[user_id]['tutorial_group']
+        group = user_data[user_id]['group_number']
+        if group == 'None':
+            group = 'none'
+        if module == None or tutorial == None or group == None:
+            await update.message.reply_text('Please input the missing data.')
+        else:
+            # Group database
+            # Users collection
+            await update.message.reply_text('Data has been uploaded.')
+            user_doc_1 = user_col_1.find_one({'user_id': user_id})
+            if user_doc_1 == None:
+                user_col_1.insert_one({'user_id': user_id, 'user_name': user_name, 'modules': [{'module_code': module, 'tutorial_group': tutorial, 'group_number': group}]})
+            else:
+                # Here, we're checking if the user has already inputted this specific module, tutorial, and group.
+                # If not, we add it to their document.
+                if not any(module_dict['module_code'] == module and module_dict['tutorial_group'] == tutorial and module_dict['group_number'] == group for module_dict in user_doc_1['modules']):
+                    user_col_1.update_one({'user_id': user_id}, {'$push': {'modules': {'module_code': module, 'tutorial_group': tutorial, 'group_number': group}}})
+
+            # Modules collection
+            module_doc_1 = mod_col_1.find_one({'module_code': module, 'tutorial_group': tutorial, 'group_number': group})
+            if module_doc_1 == None:
+                mod_col_1.insert_one({'module_code': module, 'tutorial_group': tutorial, 'group_number': group, 'chat': None,'users': [user_id], 'attendance_code': 'none'})
+                await update.message.reply_text(
+                    'There is no chat associated with your group. Please use the chat command to invite members to a chat group.')
+            else:
+                # Here, we're checking if this specific user, tutorial, and group are already associated with this module.
+                # If not, we add them to the document.
+                chat = module_doc_1['chat']
+                mod_col_1.update_one({'module_code': module, 'tutorial_group': tutorial, 'group_number': group}, {'$push': {'users': user_id}, '$set': {'attendance_code': 'none'}})
+                if chat == None and group != 'none':
+                    await update.message.reply_text('There is no chat group associated with your group. Please use the chat command with the module code to invite members to a chat group.')
+                elif chat != None:
+                    await update.message.reply_text('Please use the invite link to join the chat group associated with your group.')
+                    await update.message.reply_text(chat)
+
+            # Attendance database
+            # Users collection
+            user_doc_2 = user_col_2.find_one({'user_id': user_id})
+            if user_doc_2 == None:
+                user_col_2.insert_one({'user_id': user_id, 'user_name': user_name, 'modules': [{'module_code': module, 'tutorial_group': tutorial, 'dates': []}]})
+            else:
+                if not any(module_dict['module_code'] == module and module_dict['tutorial_group'] == tutorial for module_dict in user_doc_2['modules']):
+                    user_col_2.update_one({'user_id': user_id}, {'$push': {'modules': {'module_code': module, 'tutorial_group': tutorial, 'dates': []}}})
+
+            # Modules collection
+            module_doc_2 = mod_col_2.find_one({'module_code': module, 'tutorial_group': tutorial})
+            if module_doc_2 == None:
+                mod_col_2.insert_one({'module_code': module, 'tutorial_group': tutorial, 'users': [user_id]})
+            else:
+                mod_col_2.update_one({'module_code': module, 'tutorial_group': tutorial},{'$push': {'users': user_id}, '$set': {'attendance_code': 'none'}})
+            # Random groups
+            if group == 'none':
+                module_doc_1 = mod_col_1.find_one({'module_code': module, 'tutorial_group': tutorial})
+                users = module_doc_1['users']
+                size = int(module_doc_1['group_size'])
+                total = int(module_doc_1['tutorial_size'])
+                if len(users) == int(total):
+                    remainder = total % size
+                    counter = 1
+                    if remainder > size / 2:
+                        # Clearing excess by forming 1 additional group
+                        while len(users) != remainder:
+                            new_group = random.sample(users, size)
+                            for user in new_group:
+                                users.remove(user)
+                                user_col_1.update_one({'user_id': user},{'$push': {'modules': {'group_number': str(counter)}}})
+                                # Message to members to use chat command
+                                await bot.send_message(chat_id = user, text = 'You have been randomly assigned to group {}. Please use the chat command with the module code to invite your group members to a chat group.'.format(counter))
+                            mod_col_1.insert_one({'module_code': module, 'tutorial_group': tutorial, 'group_number': str(counter),'chat': None,'users': new_group, 'attendance_code': 'none'})
+                            counter += 1
+                        mod_col_1.insert_one({'module_code': module, 'tutorial_group': tutorial, 'group_number': str(counter),'chat': None,'users': users, 'attendance_code': 'none'})
+                    else:
+                        # Clearing excess by adding 1 to group size
+                        while remainder > 0:
+                            new_group = random.sample(users, size + 1)
+                            for user in new_group:
+                                users.remove(user)
+                                # Updating user collection
+                                doc = user_col_1.find_one({'user_id': user})
+                                lst = doc['modules']
+                                num = lst.index({'module_code': module, 'tutorial_group': tutorial, 'group_number': 'none'})
+                                lst[num]['group_number'] = str(counter)
+                                doc['modules'] = lst
+                                user_col_1.replace_one({'user_id': user}, doc)
+                                # Message to members to use chat command
+                                await bot.send_message(chat_id = user, text = 'You have been randomly assigned to group {}. Please use the chat command with the module code to invite your group members to a chat group.'.format(counter))
+                            mod_col_1.insert_one({'module_code': module, 'tutorial_group': tutorial, 'group_number': str(counter), 'chat': None, 'users': new_group, 'attendance_code': 'none'})
+                            counter += 1
+                            remainder -= 1
+                        # Forming remaining groups
+                        while len(users) > 0:
+                            new_group = random.sample(users, size)
+                            for user in new_group:
+                                users.remove(user)
+                                # Updating user collection
+                                doc = user_col_1.find_one({'user_id': user})
+                                lst = doc['modules']
+                                num = lst.index({'module_code': module, 'tutorial_group': tutorial, 'group_number': 'none'})
+                                lst[num]['group_number'] = str(counter)
+                                doc['modules'] = lst
+                                user_col_1.replace_one({'user_id': user}, doc)
+                                # Message to members to use chat command
+                                await bot.send_message(chat_id = user, text = 'You have been randomly assigned to group {}. Please use the chat command with the module code to invite your group members to a chat group.'.format(counter))
+                            mod_col_1.insert_one({'module_code': module, 'tutorial_group': tutorial, 'group_number': str(counter), 'chat': None, 'users': new_group, 'attendance_code': 'none'})
+                            counter += 1
+                    mod_col_1.delete_one({'module_code': module, 'tutorial_group': tutorial, 'tutorial_size': str(total), 'group_size': str(size)})
+    else:
+        await update.message.reply_text('Please input your data.')
+
+
+# Command to set chat groups
+async def chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    bot = Bot(token=TOKEN)
+    user_id = str(update.message.from_user['id'])
+    module = get_last_word(update.message.text)
+    # Retrieving the user's tutorial and group
+    user_doc = user_col_1.find_one({'user_id': user_id})['modules']
+    user_doc = list(filter(lambda x: x['module_code'] == module, user_doc))[0]
+    tutorial = user_doc['tutorial_group']
+    group = user_doc['group_number']
+    # Sending invite link to existing users
+    invite_link = await bot.export_chat_invite_link(update.effective_chat.id)
+    module_doc = mod_col_1.find_one({'module_code': module, 'tutorial_group': tutorial, 'group_number': group})
+    module_doc['chat'] = invite_link
+    users = module_doc['users']
+    for user in users:
+        if user != user_id:
+            try:
+                await bot.send_message(chat_id = user_id, text = 'Please use this link to join your group.')
+                await bot.send_message(chat_id = user_id, text = invite_link)
+            except Exception as e:
+                await update.message.reply_text(f'Failed to send invite link to {user_id}: {e}')
+    # Uploading invite link to MongoDB
+    mod_col_1.update_one({'module_code': module, 'tutorial_group': tutorial, 'group_number': group},
+                         {'$set': {'chat': invite_link}})
+    await update.message.reply_text('Chat Group has been set.')
+
+# Attendance commands
+MODULE_CODE_CODE, TUTORIAL_GROUP_CODE, ATTENDANCE_CODE_CODE = range(3)
+
+
+# Command to set a code for attendance
+
+async def set_code(update, context):
+    await update.message.reply_text('Please note that this command is restricted to TAs.')
+    # Ask the user for their module code
+    await update.message.reply_text('Please enter your module code:')
+    return MODULE_CODE_CODE
+
+
+async def set_module(update, context):
+    user_id = str(update.message.from_user['id'])
+    # Save the module code
+    module_code = update.message.text
+    if user_id not in user_data:
+        user_data[user_id] = {'module_code': None, 'tutorial_group': None, 'group_number': None}
+    user_data[user_id]['module_code'] = module_code
+    # Ask the user for their tutorial group
+    await update.message.reply_text('Thank you! Now, please enter your tutorial group:')
+    return TUTORIAL_GROUP_CODE
+
+
+async def set_tutorial(update, context):
+    user_id = str(update.message.from_user['id'])
+    # Save the tutorial group
+    tutorial_group = update.message.text
+    user_data[user_id]['tutorial_group'] = tutorial_group
+    module_code = user_data[user_id]['module_code']
+    # Check TA status
+    ta_doc = ta_col_1.find_one({'user_id': user_id})
+    if ta_doc == None:
+        await update.message.reply_text('User does not have TA status for this module and tutorial.')
+    else:
+        for mod in ta_doc['modules']:
+            if mod == {'module_code': module_code, 'tutorial_group': tutorial_group}:
+                # Ask the user for their intra-tutorial group number
+                await update.message.reply_text('Great! Finally, please enter your passcode:')
+    return ATTENDANCE_CODE_CODE
+
+
+async def set_attendance_code(update, context):
+    user_id = str(update.message.from_user['id'])
+    # Save the intra-tutorial group number
+    new_code = update.message.text
+    module_code = user_data[user_id]['module_code']
+    tutorial_group = user_data[user_id]['tutorial_group']
+    db_2['Modules'].update_one({'module_code': module_code, 'tutorial_group': tutorial_group},
+                               {'$set': {'attendance_code': new_code}})
+    await update.message.reply_text('Code has been set.')
+    return ConversationHandler.END
+
+# Conversation handler
+conversation_handler_code = ConversationHandler(
+    entry_points=[CommandHandler('set_code', set_code)],
+    states={
+        MODULE_CODE_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_module)],
+        TUTORIAL_GROUP_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_tutorial)],
+        ATTENDANCE_CODE_CODE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_attendance_code)],
+    },
+    fallbacks=[CommandHandler('cancel', cancel)],
+)
+
+# Add the conversation handler to the dispatcher
+app.add_handler(conversation_handler_code)
+
+# Function for students to mark their attendance
+
+MODULE_CODE_ATTENDANCE, TUTORIAL_GROUP_ATTENDANCE, PASSCODE_ATTENDANCE = range(3)
+
+async def attendance(update, context):
+    # Ask the user for their module code
+    await update.message.reply_text("Please enter your module code:")
+    return MODULE_CODE
+
+async def input_module_code(update, context):
+    user_id = str(update.message.from_user['id'])
+    # Save the module code
+    module_code = update.message.text
+    if user_id not in user_data:
+        user_data[user_id] = {'module_code': None, 'tutorial_group': None, 'group_number': None}
+    user_data[user_id]['module_code'] = module_code
+    # Ask the user for their tutorial group
+    await update.message.reply_text("Thank you! Now, please enter your tutorial group:")
+    return TUTORIAL_GROUP
+
+async def input_tutorial_group(update, context):
+    user_id = str(update.message.from_user['id'])
+    # Save the tutorial group
+    tutorial_group = update.message.text
+    user_data[user_id]['tutorial_group'] = tutorial_group
+    # Ask the user for their intra-tutorial group number
+    await update.message.reply_text("Great! Finally, please enter the passcode:")
+    return GROUP_NUMBER
+
+async def input_passcode(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user['id'])
+    entered_passcode = update.message.text
+    module = user_data[user_id]['module_code']
+    tutorial = user_data[user_id]['tutorial_group']
+    user_doc = user_col_2.find_one({'user_id': user_id})
+    module_doc = mod_col_2.find_one({'module_code': module, 'tutorial_group': tutorial})
+    if module_doc and user_doc:
+        passcode = module_doc['attendance_code']
+        if entered_passcode == passcode:    
+            modules = user_doc['modules']        
+            for doc in db_2['Users'].find():
+                for m in doc['modules']:
+                    if m['module_code'] == module and m['tutorial_group'] == tutorial:
+                        current_date = str(datetime.today().date())
+                        if 'dates' not in m:
+                            m['dates'] = []
+                        m['dates'].append(current_date)
+                        db_2['Users'].update_one(
+                            {'_id': doc['_id'], 'modules.module_code': module, 'modules.tutorial_group': tutorial},
+                            {'$set': {'modules.$.dates': m['dates']}})
+                        await update.message.reply_text('Attendance has been marked.')
+                        return ConversationHandler.END
+        else:
+            await update.message.reply_text('The passcode is incorrect.')
+            return ConversationHandler.END
+                    
+    else:
+        await update.message.reply_text('Module or tutorial not found.')
+        return ConversationHandler.END
+
+# Conversation handler
+conversation_handler_attendance = ConversationHandler(
+    entry_points=[CommandHandler('attendance', attendance)],
+    states={
+        MODULE_CODE_ATTENDANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_module_code)],
+        TUTORIAL_GROUP_ATTENDANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_tutorial_group)],
+        PASSCODE_ATTENDANCE: [MessageHandler(filters.TEXT & ~filters.COMMAND, input_passcode)],
+    },
+    fallbacks=[CommandHandler('cancel', cancel)],
+)
+
+# Add the conversation handler to the dispatcher
+app.add_handler(conversation_handler_attendance)
+
+# TA commands
+
+# Command to set TA status
+async def set_ta(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user['id'])
+    module = user_data[user_id]['module_code']
+    tutorial = user_data[user_id]['tutorial_group']
+    ta_doc = ta_col_1.find_one({'user_id': user_id})
+    if ta_doc == None:
+        ta_col_1.insert_one({'user_id': user_id, 'modules': [{'module_code': module, 'tutorial_group': tutorial}]})
+    else:
+        modules = ta_doc['modules']
+        if {'module_code': module, 'tutorial_group': tutorial} not in modules:
+            ta_col_1.update_one({'user_id': user_id},
+                                {'$push': {'modules': {'module_code': module, 'tutorial_group': tutorial}}})
+    await update.message.reply_text('TA status has been recorded.')
+
+TUTORIAL_GROUP_SIZE, GROUP_SIZE = range(2)
+tmpTutorial, tmpGroup = None, None
+async def set_tutorial_size(update, context):
+    await update.message.reply_text('Please note that this command is restricted to TAs.')
+    # Ask the user for their module code
+    await update.message.reply_text('Please enter your tutorial size:')
+    return TUTORIAL_GROUP_SIZE
+
+async def set_group_size(update, context):
+    global tmpTutorial
+    user_id = str(update.message.from_user['id'])
+    # Save the tutorial size
+    tmpTutorial = update.message.text
+    await update.message.reply_text('Please enter your tutorial size:')
+    return GROUP_SIZE
+
+async def set_size_end(update, context):
+    global tmpGroup
+    user_id = str(update.message.from_user['id'])
+    # Save the group size
+    tmpGroup = update.message.text
+    await update.message.reply_text('Thank you! Your group size have been changed!')
+    if user_id not in user_data:
+        await update.message.reply_text('Please input module and tutorial.')
+    else:
+        module = user_data[user_id]['module_code']
+        tutorial = user_data[user_id]['tutorial_group']
+        ta_doc = ta_col_1.find_one({'user_id': user_id})
+        if ta_doc == None:
+            await update.message.reply_text('This command is restricted to TAs.')
+        else:
+            for mod in ta_doc['modules']:
+                if mod == {'module_code': module, 'tutorial_group': tutorial}:
+                    module_doc_1 = mod_col_1.find_one({'module_code': module, 'tutorial_group': tutorial})
+                    if module_doc_1 == None:
+                        mod_col_1.insert_one(
+                            {'module_code': module, 'tutorial_group': tutorial, 'group_number': 'none', 'chat': None,
+                             'users': [], 'tutorial_size': tmpTutorial, 'group_size': tmpGroup})
+                        await update.message.reply_text('Size has been set.')
+                        return None
+                    elif mod_col_1.count({'module_code': module, 'tutorial_group': tutorial}) == 1:
+                        mod_col_1.update_one({'module_code': module, 'tutorial_group': tutorial},
+                                             {'$push': {'tutorial_size': tmpTutorial, 'group_size': tmpGroup}})
+                        await update.message.reply_text('Size has been edited.')
+                        return None
+            await update.message.reply_text('This command is restricted to TAs.')
+    return ConversationHandler.END
+
+# Command to set the size of a tutorial group (tutorial size followed by group size)
+async def set_size(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user['id'])
+    lst = update.message.text.split()
+    if user_id not in user_data:
+        await update.message.reply_text('Please input module and tutorial.')
+    else:
+        module = user_data[user_id]['module_code']
+        tutorial = user_data[user_id]['tutorial_group']
+        ta_doc = ta_col_1.find_one({'user_id': user_id})
+        if ta_doc == None:
+            await update.message.reply_text('This command is restricted to TAs.')
+        else:
+            for mod in ta_doc['modules']:
+                if mod == {'module_code': module, 'tutorial_group': tutorial}:
+                    module_doc_1 = mod_col_1.find_one({'module_code': module, 'tutorial_group': tutorial})
+                    if module_doc_1 == None:
+                        mod_col_1.insert_one(
+                            {'module_code': module, 'tutorial_group': tutorial, 'group_number': 'none', 'chat': None,
+                             'users': [], 'tutorial_size': lst[1], 'group_size': lst[2]})
+                        await update.message.reply_text('Size has been set.')
+                        return None
+                    elif mod_col_1.count({'module_code': module, 'tutorial_group': tutorial}) == 1:
+                        mod_col_1.update_one({'module_code': module, 'tutorial_group': tutorial},
+                                             {'$push': {'tutorial_size': lst[1], 'group_size': lst[2]}})
+                        await update.message.reply_text('Size has been edited.')
+                        return None
+            await update.message.reply_text('This command is restricted to TAs.')
+
+# Conversation handler
+conversation_handler_size = ConversationHandler(
+    entry_points=[CommandHandler('set_size', set_tutorial_size)],
+    states={
+        TUTORIAL_GROUP_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_group_size)],
+        GROUP_SIZE: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_size_end)]
+    },
+    fallbacks=[CommandHandler('cancel', cancel)],
+)
+
+# Add the conversation handler to the dispatcher
+app.add_handler(conversation_handler_size)
+
+
+# Command to move students between groups within the same tutorial (assumes group chats have been formed)
+
+MODULE_CODE_MOVE, TUTORIAL_GROUP_MOVE, USER_ID_MOVE, NEW_GROUP_MOVE = range(4)
+
+async def move(update, context):
+    await update.message.reply_text('Please note that this command is restricted to TAs.')
+    # Ask the user for their module code
+    await update.message.reply_text('Please enter your module code:')
+    return MODULE_CODE_CODE
+
+async def move_module(update, context):
+    user_id = str(update.message.from_user['id'])
+    # Save the module code
+    module_code = update.message.text
+    if user_id not in user_data:
+        user_data[user_id] = {'module_code': None, 'tutorial_group': None, 'group_number': None}
+    user_data[user_id]['module_code'] = module_code
+    # Ask the user for their tutorial group
+    await update.message.reply_text('Thank you! Now, please enter your tutorial group:')
+    return TUTORIAL_GROUP_MOVE
+
+async def move_tutorial(update, context):
+    user_id = str(update.message.from_user['id'])
+    # Save the tutorial group
+    tutorial_group = update.message.text
+    user_data[user_id]['tutorial_group'] = tutorial_group
+    module_code = user_data[user_id]['module_code']
+    # Check TA status
+    ta_doc = ta_col_1.find_one({'user_id': user_id})
+    if ta_doc == None:
+        await update.message.reply_text('User does not have TA status for this module and tutorial.')
+    else:
+        for mod in ta_doc['modules']:
+            if mod == {'module_code': module_code, 'tutorial_group': tutorial_group}:
+                # Ask the user for their intra-tutorial group number
+                await update.message.reply_text('Great! Now please enter the ID of the student you would like to move:')
+                return USER_ID_MOVE
+        await update.message.reply_text('User does not have TA status for this module and tutorial.')
+
+async def move_id(update, context):
+    user_id = str(update.message.from_user['id'])
+    move_target[user_id] = update.message.text
+    await update.message.reply_text('Last step! Please enter the group number you would like to move the student to:')
+    return NEW_GROUP_MOVE
+
+async def move_group(update, context):
+    user_id = str(update.message.from_user['id'])
+    module_code = user_data[user_id]['module_code']
+    tutorial_group = user_data[user_id]['tutorial_group']
+    old_group = None
+    new_group = update.message.text
+    target_id = move_target[user_id]
+    # Edit user collection
+    user_doc = user_col_1.find_one({'user_id': target_id})
+    user_modules = user_doc['modules']
+    for user_mod in user_modules:
+        if module_code in user_mod.values() and tutorial_group in user_mod.values():
+            old_group = user_mod['group_number']
+            user_mod['group_number'] = new_group
+            break
+    user_doc['modules'] = user_modules
+    user_col_1.replace_one({'user_id': target_id}, user_doc)
+    # Edit module collection
+    module_doc_1 = mod_col_1.find_one(
+        {'module_code': module_code, 'tutorial_group': tutorial_group, 'group_number': old_group})
+    lst_1 = module_doc_1['users']
+    lst_1.remove(target_id)
+    module_doc_1['users'] = lst_1
+    mod_col_1.replace_one({'module_code': module_code, 'tutorial_group': tutorial_group, 'group_number': old_group}, module_doc_1)
+    # Add to new group
+    module_doc_2 = mod_col_1.find_one(
+        {'module_code': module_code, 'tutorial_group': tutorial_group, 'group_number': new_group})
+    lst_2 = module_doc_2['users']
+    lst_2.append(target_id)
+    module_doc_2['users'] = lst_2
+    invite_link = module_doc_2['chat']
+    mod_col_1.replace_one({'module_code': module_code, 'tutorial_group': tutorial_group, 'group_number': new_group},module_doc_2)
+    # Send new invite link
+    await bot.send_message(chat_id=target_id,text='You have been moved to group ' + new_group + ' for module ' + module_code + '. Please use the invite link to join your new group.')
+    await bot.send_message(chat_id=target_id, text=invite_link)
+    await update.message.reply_text('Student has been moved.')
+
+
+# Conversation handler
+conversation_handler_move = ConversationHandler(
+    entry_points=[CommandHandler('move', move)],
+    states={
+        MODULE_CODE_MOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, move_module)],
+        TUTORIAL_GROUP_MOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, move_tutorial)],
+        USER_ID_MOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, move_id)],
+        NEW_GROUP_MOVE: [MessageHandler(filters.TEXT & ~filters.COMMAND, move_group)],
+    },
+    fallbacks=[CommandHandler('cancel', cancel)],
+)
+
+# Add the conversation handler to the dispatcher
+app.add_handler(conversation_handler_move)
+
+
+# Admin exclusive commands
+
+# Command to erase the database
+async def wipe_database(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = str(update.message.from_user['id'])
+    if user_id == '813592762' or user_id == '928044342':
+        mod_col_1.delete_many({})
+        user_col_1.delete_many({})
+        ta_col_1.delete_many({})
+        mod_col_2.delete_many({})
+        user_col_2.delete_many({})
+        await update.message.reply_text('All documents have been deleted.')
+    else:
+        await update.message.reply_text('Use of this command is restricted.')
+
+
+# Behind the scene functions
+
+def get_last_word(text):
+    # Split the text into words using spaces as delimiters
+    words = text.split()
+
+    if len(words) > 0:
+        # Return the last word
+        return words[-1]
+    else:
+        # Return None if the text is empty
+        return None
+
+
+def handle_response(text: str) -> str:
+    # Create your own response logic
+    processed: str = text.lower()
+
+    if 'hello' in processed:
+        return 'Hey there!'
+
+    if 'how are you' in processed:
+        return 'I\'m good!'
+
+    return 'I don\'t understand'
+
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    global is_bot_active
+
+    if not is_bot_active:
+        return
+
+    # Get basic info of the incoming message
+    message_type: str = update.message.chat.type
+    text: str = update.message.text
+
+    # Print a log for debugging
+    print(f'User ({update.message.chat.id}) in {message_type}: "{text}"')
+
+    # React to group messages only if users mention the bot directly
+    if message_type == 'group_number':
+        if text.startswith(BOT_USERNAME):
+            new_text: str = text.replace(BOT_USERNAME, '').strip()
+            if new_text.startswith('@'):
+                response: str = handle_response(new_text)
+            else:
+                return  # We don't want the bot to respond if it's not directly addressed
+        else:
+            return  # We don't want the bot to respond if it's not mentioned at the beginning
+    else:
+        if text.startswith('@'):
+            new_text: str = text.replace('@', '').strip()
+            response: str = handle_response(new_text)
+        else:
+            return  # We don't want the bot to respond if it's not directly addressed
+
+    # Reply normally if the message is in private
+    print('Bot:', response)
+    await update.message.reply_text(response)
+
+
+# Log errors
+async def error(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    print(f'Update {update} caused error {context.error}')
+
+# Commands
+app.add_handler(CommandHandler('start', start_command))
+app.add_handler(CommandHandler('stop', stop_command))
+app.add_handler(CommandHandler('help', help_command))
+app.add_handler(CommandHandler('info', get_my_info))
+app.add_handler(CommandHandler('upload', upload))
+app.add_handler(CommandHandler('chat', chat))
+app.add_handler(CommandHandler('set_ta', set_ta))
+app.add_handler(CommandHandler('wipe_database', wipe_database))
+
+# Messages
+app.add_handler(MessageHandler(filters.TEXT, handle_message))
+
+# Log all errors
+app.add_error_handler(error)
+print('Polling...')
+
+# Run the bot
+app.run_polling(poll_interval=5)
