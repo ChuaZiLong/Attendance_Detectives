@@ -1,0 +1,13 @@
+start - Starts the bot
+stop - Stops the bot
+help - Provides instructions on how to operate the bot
+inputinfo - Prompts the bot to ask you for your module code, tutorial group and intra-tutorial group
+info - Retrieves your information which is stored temporarily until you use /upload
+upload - Uploads your information onto a MongoDB database
+chat - Sets your current chat group as the official chat group for your intra-tutorial group
+set_code - Sets the passcode for attendance-taking
+attendance - Allows you to mark your attendance
+set_ta - Sets yourself as a Teaching Assistant
+set_size - Sets the size of intra-tutorial groups
+move - Moves students between groups
+wipe_database - Wipes the MongoDB databases completely
